@@ -39,7 +39,15 @@ class TextEncoder(nn.Module):
         self.dtype = clip_model.dtype
 
     def forward(self, prompts, tokenized_prompts): 
+        # print("prompts size ",prompts.size())
+        # print("positional_embedding size",self.positional_embedding.size())
+        # embedding_padding = torch.zeros(prompts.size()[1]-self.positional_embedding.size()[0],self.positional_embedding.size()[1]).cuda()
+        # new_embedding = torch.cat([embedding_padding,self.positional_embedding],dim=0)
+        # print(embedding_padding)
+        # print(new_embedding)
+        
         x = prompts + self.positional_embedding.type(self.dtype) 
+        # x=prompts+new_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND 
         x = self.transformer(x) 
         x = x.permute(1, 0, 2)  # LND -> NLD
@@ -83,6 +91,9 @@ class build_transformer(nn.Module):
         self.h_resolution = int((cfg.INPUT.SIZE_TRAIN[0]-16)//cfg.MODEL.STRIDE_SIZE[0] + 1)
         self.w_resolution = int((cfg.INPUT.SIZE_TRAIN[1]-16)//cfg.MODEL.STRIDE_SIZE[1] + 1)
         self.vision_stride_size = cfg.MODEL.STRIDE_SIZE[0]
+        # print("h_resolution: ",self.h_resolution)
+        # print("w_resolution: ",self.w_resolution)
+        # print("vision_stride_size",self.vision_stride_size)
         clip_model = load_clip_to_cpu(self.model_name, self.h_resolution, self.w_resolution, self.vision_stride_size)
         clip_model.to("cuda")
         self.dtype = clip_model.dtype #new
@@ -103,6 +114,7 @@ class build_transformer(nn.Module):
 
         dataset_name = cfg.DATASETS.NAMES
         # self.prompt_learner = PromptLearner(num_classes, dataset_name, clip_model.dtype, clip_model.token_embedding)
+        
         self.prompt_learner = PromptLearner(num_classes, dataset_name, clip_model.dtype, clip_model.token_embedding,clip_model.visual.output_dim)
         self.text_encoder = TextEncoder(clip_model)
 
@@ -186,7 +198,7 @@ def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_si
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-
+    # print("state_dict ",model.state_dict)
     model = clip.build_model(state_dict or model.state_dict(), h_resolution, w_resolution, vision_stride_size)
 
     return model
@@ -204,20 +216,37 @@ class PromptLearner(nn.Module):
         # use given words to initialize context vectors
         ctx_init = ctx_init.replace("_", " ")
         n_ctx = 4
-        
+        # print("dtype",dtype)
         tokenized_prompts = clip.tokenize(ctx_init).cuda() 
         with torch.no_grad():
             embedding = token_embedding(tokenized_prompts).type(dtype) 
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-
+        # print("tokenized_prompts size ",tokenized_prompts.size())
         n_cls_ctx = 4
         cls_vectors = torch.empty(num_class, n_cls_ctx, ctx_dim, dtype=dtype) 
         nn.init.normal_(cls_vectors, std=0.02)
         self.cls_ctx = nn.Parameter(cls_vectors) 
+        # print(" num_class size ",num_class)
+        # print("vis_dim ",vis_dim)
         self.meta_net = nn.Sequential(OrderedDict([
-            ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
-            ("relu", nn.ReLU(inplace=True)),
-            ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
+            # ("linear1", nn.Linear(2, vis_dim // 16)),
+            # ("relu", nn.ReLU(inplace=True)),
+            # ("linear2", nn.Linear(vis_dim // 16, ctx_dim)
+            ("linear1", nn.Linear(2, vis_dim//16)),
+            ("relu",nn.ReLU(inplace=True)),
+            ("linear2",nn.Linear(vis_dim//16,ctx_dim)),
+            
+            
+        ])) 
+        self.meta_net_img = nn.Sequential(OrderedDict([
+            # ("linear1", nn.Linear(2, vis_dim // 16)),
+            # ("relu", nn.ReLU(inplace=True)),
+            # ("linear2", nn.Linear(vis_dim // 16, ctx_dim)
+            ("linear1", nn.Linear(vis_dim, vis_dim//16)),
+            ("relu",nn.ReLU(inplace=True)),
+            ("linear2",nn.Linear(vis_dim//16,ctx_dim)),
+            
+            
         ])) 
         #new layer
         
@@ -228,6 +257,18 @@ class PromptLearner(nn.Module):
         self.register_buffer("token_suffix", embedding[:, n_ctx + 1 + n_cls_ctx: , :])  
         self.num_class = num_class
         self.n_cls_ctx = n_cls_ctx
+        self.ctx_dim = ctx_dim
+
+    def calculate_channel_statistics(self,im_features):
+        mean_values = torch.mean(im_features, axis=1,keepdim=True)
+        std_values = torch.std(im_features, axis=1,keepdim=True)
+        final_value = torch.cat([mean_values,std_values],dim=1)
+        # print(final_value.size())
+        # final_value = mean_std_vec.repeat(im_features.size()[0],1)
+        return final_value
+
+        
+        
 
     def forward(self, label,im_features=None):
         #with image features
@@ -236,20 +277,41 @@ class PromptLearner(nn.Module):
         prefix = self.token_prefix.expand(b, -1, -1) 
         suffix = self.token_suffix.expand(b, -1, -1) 
         if(im_features != None):
-            bias = self.meta_net(im_features)
+            # print("im_features_size ",im_features.size())
+            # print("bias size ",bias.size())
+            # print("cls_ctx ",cls_ctx.size())
+            new_matrix = self.calculate_channel_statistics(im_features)
+            # print("new_matrix size ", new_matrix.size())
+            bias = self.meta_net(new_matrix)
             bias = bias.unsqueeze(1)
-            cls_ctx = cls_ctx+bias
+            im = self.meta_net_img(im_features)
+            im=im.unsqueeze(1)
+
+            
         
             
-        prompts = torch.cat(
-            [
-                prefix,  # (n_cls, 1, dim)
-                cls_ctx,     # (n_cls, n_ctx, dim)
-                suffix,  # (n_cls, *, dim)
-            ],
-            dim=1,
-        ) 
-
+            prompts = torch.cat(
+                [
+                    # bias,
+                    
+                    prefix,  # (n_cls, 1, dim)
+                    cls_ctx,     # (n_cls, n_ctx, dim)
+                    im,
+                    bias,
+                    suffix[:,:suffix.size()[1]-2,:],  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
+        else: 
+            prompts = torch.cat(
+                    [
+                        prefix,  # (n_cls, 1, dim)
+                        cls_ctx,     # (n_cls, n_ctx, dim)
+                        suffix,  # (n_cls, *, dim)
+                    ],
+                    dim=1,
+                ) 
+        # print("prompts size",prompts.size())
         return prompts 
 
 
